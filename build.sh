@@ -20,6 +20,18 @@ else
     echo "Vosk model already exists at $VOSK_MODELS_DIR/$VOSK_MODEL"
 fi
 
+# Download only openwakeword preprocessing .onnx models (not bundled wake words)
+$PYTHON -c "
+import os, openwakeword, openwakeword.utils
+d = os.path.join(os.path.dirname(openwakeword.__file__), 'resources', 'models')
+os.makedirs(d, exist_ok=True)
+for m in list(openwakeword.FEATURE_MODELS.values()) + list(openwakeword.VAD_MODELS.values()):
+    url = m['download_url'].replace('.tflite', '.onnx')
+    f = os.path.join(d, url.split('/')[-1])
+    if not os.path.exists(f):
+        openwakeword.utils.download_file(url, d)
+"
+
 # Install pyinstaller
 echo "Installing PyInstaller..."
 if ! $PYTHON -m pip install pyinstaller -Uqq; then
@@ -35,4 +47,4 @@ $PYTHON -m PyInstaller main.spec
 
 # Create archive with meta.json
 echo "Creating archive..."
-tar -czf dist/archive.tar.gz -C dist main -C .. meta.json
+tar -czf dist/archive.tar.gz dist/main meta.json vosk_models

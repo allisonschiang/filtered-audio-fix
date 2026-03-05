@@ -1,13 +1,17 @@
 """Vosk model utilities."""
 
+import json
 import os
 import sys
 import tempfile
 from pathlib import Path
-import ssl
-import urllib.request
+from typing import Any, Optional
 import zipfile
-import certifi
+
+from vosk import Model as VoskModel, KaldiRecognizer
+
+from .download import download_file
+from .fuzzy_matcher import FuzzyWakeWordMatcher
 
 
 BASE_VOSK_URL = "https://alphacephei.com/vosk/models"
@@ -139,18 +143,9 @@ def _download_vosk_model(model_name, logger) -> str:
 
     url = f"{BASE_VOSK_URL}/{model_name}.zip"
     zip_path = (Path(tempfile.gettempdir()) / f"{model_name}.zip").resolve()
-    ssl_context = ssl.create_default_context(cafile=certifi.where())
-
-    logger.debug(f"Downloading Vosk model from {url}...")
 
     try:
-        with urllib.request.urlopen(url, context=ssl_context, timeout=120) as response:
-            with open(zip_path, "wb") as out_file:
-                while True:
-                    chunk = response.read(8192)
-                    if not chunk:
-                        break
-                    out_file.write(chunk)
+        download_file(url, str(zip_path), logger)
     except Exception as e:
         logger.error(f"Failed to download Vosk model: {e}")
         raise RuntimeError(f"Failed to download Vosk model: {e}")
@@ -167,3 +162,52 @@ def _download_vosk_model(model_name, logger) -> str:
 
     logger.info("Vosk model downloaded and extracted successfully")
     return model_dir
+
+
+AUDIO_SAMPLE_RATE_HZ = 16000
+DEFAULT_GRAMMAR_CONFIDENCE = 0.7
+
+
+def setup_vosk(
+    instance: Any,
+    vosk_model: str = DEFAULT_VOSK_MODEL,
+    use_grammar: bool = True,
+    grammar_confidence: float = DEFAULT_GRAMMAR_CONFIDENCE,
+    fuzzy_threshold: Optional[int] = None,
+) -> None:
+    """
+    Set up Vosk detection engine on a WakeWordFilter instance.
+
+    Loads the Vosk model, creates a KaldiRecognizer (optionally with
+    grammar), and configures fuzzy matching if requested.
+    """
+    # Load Vosk model (checks bundled, then cached, then downloads)
+    model_path = get_vosk_model(vosk_model, instance.logger)
+    instance.vosk_model = VoskModel(model_path)
+    instance.logger.debug("Vosk model loaded")
+
+    instance.use_grammar = use_grammar
+    instance.grammar_confidence = grammar_confidence
+    instance.logger.info(f"Vosk grammar mode: {instance.use_grammar}")
+    instance.logger.info(
+        f"Vosk grammar confidence threshold: {instance.grammar_confidence:.2f}"
+    )
+
+    # Create recognizer
+    if instance.use_grammar and instance.wake_words:
+        grammar = json.dumps(instance.wake_words)
+        instance.recognizer = KaldiRecognizer(
+            instance.vosk_model, AUDIO_SAMPLE_RATE_HZ, grammar
+        )
+    else:
+        instance.recognizer = KaldiRecognizer(instance.vosk_model, AUDIO_SAMPLE_RATE_HZ)
+
+    instance.recognizer.SetWords(True)  # Enable word-level confidence scores
+    instance.logger.debug("Vosk recognizer initialized")
+
+    # Fuzzy matching - enabled if fuzzy_threshold is set
+    if fuzzy_threshold is not None:
+        instance.fuzzy_matcher = FuzzyWakeWordMatcher(threshold=fuzzy_threshold)
+        instance.logger.info(f"Fuzzy matching enabled with threshold={fuzzy_threshold}")
+    else:
+        instance.fuzzy_matcher = None

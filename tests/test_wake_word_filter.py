@@ -28,24 +28,18 @@ def mock_env():
     """Mock all WakeWordFilter.new() dependencies"""
     with (
         patch("src.models.wake_word_filter.struct_to_dict") as mock_struct,
-        patch("src.models.wake_word_filter.VoskModel") as mock_vosk,
-        patch("src.models.wake_word_filter.KaldiRecognizer") as mock_recognizer,
+        patch("src.models.wake_word_filter.setup_vosk") as mock_setup_vosk,
         patch("src.models.wake_word_filter.webrtcvad.Vad") as mock_vad,
         patch("src.models.wake_word_filter.ThreadPoolExecutor") as mock_executor,
-        patch(
-            "src.models.wake_word_filter.get_vosk_model", return_value="/tmp/vosk-model"
-        ) as mock_get_vosk,
         patch(
             "src.models.wake_word_filter.AudioIn.get_resource_name", return_value="mic1"
         ) as mock_resource,
     ):
         yield {
             "struct_to_dict": mock_struct,
-            "vosk": mock_vosk,
-            "recognizer": mock_recognizer,
+            "setup_vosk": mock_setup_vosk,
             "vad": mock_vad,
             "executor": mock_executor,
-            "get_vosk_model": mock_get_vosk,
             "resource_name": mock_resource,
         }
 
@@ -103,30 +97,66 @@ def test_validate_config_empty_microphone():
 
 
 def test_validate_config_missing_wake_words():
-    """Test validate_config raises error when wake_words is missing"""
+    """Test validate_config raises error when wake_words is missing for vosk"""
     config = Mock()
     config.attributes = Mock()
 
     with patch("src.models.wake_word_filter.struct_to_dict") as mock_struct:
         mock_struct.return_value = {
-            "source_microphone": "mic1"
+            "source_microphone": "mic1",
+            "detection_engine": "vosk",
             # wake_words missing
         }
 
-        with pytest.raises(ValueError, match="wake_words attribute is required"):
+        with pytest.raises(ValueError, match="wake_words is required when using the vosk detection engine"):
             WakeWordFilter.validate_config(config)
 
 
 def test_validate_config_empty_wake_words():
-    """Test validate_config raises error when wake_words is empty list"""
+    """Test validate_config raises error when wake_words is empty for vosk"""
     config = Mock()
     config.attributes = Mock()
 
     with patch("src.models.wake_word_filter.struct_to_dict") as mock_struct:
-        mock_struct.return_value = {"source_microphone": "mic1", "wake_words": []}
+        mock_struct.return_value = {
+            "source_microphone": "mic1",
+            "wake_words": [],
+            "detection_engine": "vosk",
+        }
 
-        with pytest.raises(ValueError, match="wake_words attribute is required"):
+        with pytest.raises(ValueError, match="wake_words is required when using the vosk detection engine"):
             WakeWordFilter.validate_config(config)
+
+
+def test_validate_config_oww_missing_wake_words_ok():
+    """Test validate_config does not error when wake_words is missing for openwakeword"""
+    config = Mock()
+    config.attributes = Mock()
+
+    with patch("src.models.wake_word_filter.struct_to_dict") as mock_struct:
+        mock_struct.return_value = {
+            "source_microphone": "mic1",
+            "detection_engine": "openwakeword",
+            "oww_model_path": "/path/to/model.onnx",
+        }
+
+        WakeWordFilter.validate_config(config)  # should not raise
+
+
+def test_validate_config_oww_empty_wake_words_ok():
+    """Test validate_config does not error when wake_words is empty for openwakeword"""
+    config = Mock()
+    config.attributes = Mock()
+
+    with patch("src.models.wake_word_filter.struct_to_dict") as mock_struct:
+        mock_struct.return_value = {
+            "source_microphone": "mic1",
+            "detection_engine": "openwakeword",
+            "oww_model_path": "/path/to/model.onnx",
+            "wake_words": [],
+        }
+
+        WakeWordFilter.validate_config(config)  # should not raise
 
 
 def test_validate_config_rejects_non_string_wake_words(mock_env):
@@ -590,7 +620,7 @@ def test_new_uses_custom_vad_aggressiveness(mock_env):
 
 
 def test_new_loads_vosk_model(mock_env):
-    """Test new() loads Vosk model from correct path"""
+    """Test new() calls setup_vosk for vosk engine"""
     config = Mock()
     mic = AsyncMock()
     dependencies = {}
@@ -604,10 +634,8 @@ def test_new_loads_vosk_model(mock_env):
     dependencies["mic1"] = mic
     WakeWordFilter.new(config, dependencies)
 
-    # Verify get_vosk_model was called with the model name
-    mock_env["get_vosk_model"].assert_called_once()
-    # Verify VoskModel was called with the path returned by get_vosk_model
-    mock_env["vosk"].assert_called_once_with("/tmp/vosk-model")
+    # Verify setup_vosk was called
+    mock_env["setup_vosk"].assert_called_once()
 
 
 def test_new_sets_microphone_client(mock_env):
@@ -696,79 +724,11 @@ def test_new_uses_custom_min_speech_duration_ms(mock_env):
     assert instance.min_speech_duration_ms == 500
 
 
-def test_new_uses_default_use_grammar(mock_env):
-    """Test new() uses default use_grammar=True when not specified"""
-    config = Mock()
-    mic = AsyncMock()
-
-    mock_env["struct_to_dict"].return_value = {
-        "source_microphone": "mic1",
-        "wake_words": ["robot"],
-    }
-
-    dependencies = {"mic1": mic}
-    instance = WakeWordFilter.new(config, dependencies)
-
-    # Default is True (grammar mode)
-    assert instance.use_grammar is True
-
-
-def test_new_uses_custom_use_grammar_false(mock_env):
-    """Test new() uses custom use_grammar=False when provided"""
-    config = Mock()
-    mic = AsyncMock()
-
-    mock_env["struct_to_dict"].return_value = {
-        "source_microphone": "mic1",
-        "wake_words": ["robot"],
-        "use_grammar": False,
-    }
-
-    dependencies = {"mic1": mic}
-    instance = WakeWordFilter.new(config, dependencies)
-
-    assert instance.use_grammar is False
-
-
-def test_new_uses_default_grammar_confidence(mock_env):
-    """Test new() uses defaultvosk_grammar_confidence when not specified"""
-    config = Mock()
-    mic = AsyncMock()
-
-    mock_env["struct_to_dict"].return_value = {
-        "source_microphone": "mic1",
-        "wake_words": ["robot"],
-    }
-
-    dependencies = {"mic1": mic}
-    instance = WakeWordFilter.new(config, dependencies)
-
-    # Default is 0.7
-    assert instance.grammar_confidence == 0.7
-
-
-def test_new_uses_custom_grammar_confidence(mock_env):
-    """Test new() uses custom vosk_grammar_confidence when provided"""
-    config = Mock()
-    mic = AsyncMock()
-
-    mock_env["struct_to_dict"].return_value = {
-        "source_microphone": "mic1",
-        "wake_words": ["robot"],
-        "vosk_grammar_confidence": 0.85,
-    }
-
-    dependencies = {"mic1": mic}
-    instance = WakeWordFilter.new(config, dependencies)
-
-    assert instance.grammar_confidence == 0.85
-
-
 # # Error case tests for WakeWordFilter.new()
 
 
-def test_new_fails_when_get_vosk_model_fails(mock_env):
-    """Test new() raises error when get_vosk_model fails"""
+def test_new_fails_when_setup_vosk_fails(mock_env):
+    """Test new() raises error when setup_vosk fails"""
     config = Mock()
     mic = AsyncMock()
 
@@ -777,8 +737,8 @@ def test_new_fails_when_get_vosk_model_fails(mock_env):
         "wake_words": ["robot"],
     }
 
-    # Make get_vosk_model raise an error
-    mock_env["get_vosk_model"].side_effect = RuntimeError("Model not found")
+    # Make setup_vosk raise an error
+    mock_env["setup_vosk"].side_effect = RuntimeError("Model not found")
 
     dependencies = {"mic1": mic}
 
@@ -786,23 +746,24 @@ def test_new_fails_when_get_vosk_model_fails(mock_env):
         WakeWordFilter.new(config, dependencies)
 
 
-def test_new_calls_get_vosk_model_with_model_name(mock_env):
-    """Test new() calls get_vosk_model with the configured model name"""
+def test_new_calls_setup_vosk_with_attrs(mock_env):
+    """Test new() calls setup_vosk with the correct vosk_model kwarg"""
     config = Mock()
     mic = AsyncMock()
 
-    mock_env["struct_to_dict"].return_value = {
+    attrs = {
         "source_microphone": "mic1",
         "wake_words": ["robot"],
         "vosk_model": "vosk-model-en-us-0.22",
     }
+    mock_env["struct_to_dict"].return_value = attrs
 
     dependencies = {"mic1": mic}
     WakeWordFilter.new(config, dependencies)
 
-    # Verify get_vosk_model was called with the model name
-    call_args = mock_env["get_vosk_model"].call_args
-    assert call_args[0][0] == "vosk-model-en-us-0.22"
+    # Verify setup_vosk was called with the instance and correct vosk_model kwarg
+    call_args = mock_env["setup_vosk"].call_args
+    assert call_args[1]["vosk_model"] == "vosk-model-en-us-0.22"
 
 
 def test_new_handles_missing_microphone_in_dependencies(mock_env):
@@ -834,27 +795,27 @@ def test_check_for_wake_word_detects_wake_word_anywhere():
 
     # Wake word at start - should match
     mock_rec.FinalResult.return_value = '{"text": "robot turn on the lights"}'
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is True
 
     # Wake word in middle - should match
     mock_rec.FinalResult.return_value = '{"text": "hey robot turn on the lights"}'
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is True
 
     # Wake word at end - should match
     mock_rec.FinalResult.return_value = '{"text": "turn on the lights robot"}'
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is True
 
     # No wake word - should not match
     mock_rec.FinalResult.return_value = '{"text": "hello there how are you"}'
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is False
 
     # Empty text - should NOT match
     mock_rec.FinalResult.return_value = '{"text": ""}'
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is False
 
 
@@ -872,17 +833,17 @@ def test_check_for_wake_word_handles_multiple_wake_words():
 
     # First wake word at start
     mock_rec.FinalResult.return_value = '{"text": "robot do something"}'
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is True
 
     # Second wake word at start
     mock_rec.FinalResult.return_value = '{"text": "computer show me"}'
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is True
 
     # Multi-word wake word at start
     mock_rec.FinalResult.return_value = '{"text": "hey assistant what time"}'
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is True
 
 
@@ -900,12 +861,12 @@ def test_check_for_wake_word_respects_word_boundaries():
 
     # Should match: exact word
     mock_rec.FinalResult.return_value = '{"text": "robot turn on"}'
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is True
 
     # Should not match: wake word is part of another word
     mock_rec.FinalResult.return_value = '{"text": "robotics is cool"}'
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is False
 
 
@@ -922,7 +883,7 @@ def test_check_for_wake_word_with_grammar_mode():
     mock_rec.FinalResult.return_value = '{"text": "robot"}'
     wake_word_filter.recognizer = mock_rec
 
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is True
 
 
@@ -939,7 +900,7 @@ def test_check_for_wake_word_without_grammar_mode():
     mock_rec.FinalResult.return_value = '{"text": "robot turn on the lights"}'
     wake_word_filter.recognizer = mock_rec
 
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is True
 
 
@@ -956,7 +917,7 @@ def test_check_for_wake_word_no_grammar_no_match():
     mock_rec.FinalResult.return_value = '{"text": "hello how are you"}'
     wake_word_filter.recognizer = mock_rec
 
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is False
 
 
@@ -972,9 +933,213 @@ def test_check_for_wake_word_handles_vosk_errors():
     mock_rec.AcceptWaveform.side_effect = Exception("Vosk error")
     wake_word_filter.recognizer = mock_rec
 
-    result = WakeWordFilter._check_for_wake_word(wake_word_filter, b"\x00" * 1000)
+    result = WakeWordFilter._vosk_check_for_wake_word(wake_word_filter, b"\x00" * 1000)
     assert result is False
     wake_word_filter.logger.error.assert_called_once()
+
+
+def test_validate_config_accepts_vosk_engine(mock_env):
+    """Test validate_config accepts detection_engine='vosk'"""
+    config = Mock()
+    config.attributes = Mock()
+
+    mock_env["struct_to_dict"].return_value = {
+        "source_microphone": "mic",
+        "wake_words": ["robot"],
+        "detection_engine": "vosk",
+    }
+
+    deps, errors = WakeWordFilter.validate_config(config)
+    assert deps == ["mic"]
+    assert not errors
+
+
+def test_validate_config_accepts_openwakeword_engine(mock_env):
+    """Test validate_config accepts detection_engine='openwakeword'"""
+    config = Mock()
+    config.attributes = Mock()
+
+    mock_env["struct_to_dict"].return_value = {
+        "source_microphone": "mic",
+        "wake_words": ["robot"],
+        "detection_engine": "openwakeword",
+        "oww_model_path": "/path/to/model.onnx",
+    }
+
+    deps, errors = WakeWordFilter.validate_config(config)
+    assert deps == ["mic"]
+    assert not errors
+
+
+def test_validate_config_rejects_invalid_detection_engine(mock_env):
+    """Test validate_config raises error for invalid detection_engine"""
+    config = Mock()
+    config.attributes = Mock()
+
+    mock_env["struct_to_dict"].return_value = {
+        "source_microphone": "mic",
+        "wake_words": ["robot"],
+        "detection_engine": "whisper",
+    }
+
+    with pytest.raises(
+        ValueError, match="detection_engine must be 'vosk' or 'openwakeword'"
+    ):
+        WakeWordFilter.validate_config(config)
+
+
+def test_validate_config_defaults_to_vosk_engine(mock_env):
+    """Test validate_config defaults to vosk when detection_engine not specified"""
+    config = Mock()
+    config.attributes = Mock()
+
+    mock_env["struct_to_dict"].return_value = {
+        "source_microphone": "mic",
+        "wake_words": ["robot"],
+    }
+
+    deps, errors = WakeWordFilter.validate_config(config)
+    assert deps == ["mic"]
+    assert not errors
+
+
+# Tests for oww_model_path validation
+
+
+def test_validate_config_requires_oww_model_path_for_openwakeword(mock_env):
+    """Test validate_config raises error when oww_model_path missing for openwakeword engine"""
+    config = Mock()
+    config.attributes = Mock()
+
+    mock_env["struct_to_dict"].return_value = {
+        "source_microphone": "mic",
+        "wake_words": ["robot"],
+        "detection_engine": "openwakeword",
+    }
+
+    with pytest.raises(ValueError, match="oww_model_path is required"):
+        WakeWordFilter.validate_config(config)
+
+
+def test_validate_config_rejects_empty_oww_model_path(mock_env):
+    """Test validate_config raises error when oww_model_path is empty string"""
+    config = Mock()
+    config.attributes = Mock()
+
+    mock_env["struct_to_dict"].return_value = {
+        "source_microphone": "mic",
+        "wake_words": ["robot"],
+        "detection_engine": "openwakeword",
+        "oww_model_path": "",
+    }
+
+    with pytest.raises(ValueError, match="oww_model_path is required"):
+        WakeWordFilter.validate_config(config)
+
+
+def test_validate_config_rejects_non_string_oww_model_path(mock_env):
+    """Test validate_config raises error when oww_model_path is not a string"""
+    config = Mock()
+    config.attributes = Mock()
+
+    mock_env["struct_to_dict"].return_value = {
+        "source_microphone": "mic",
+        "wake_words": ["robot"],
+        "detection_engine": "openwakeword",
+        "oww_model_path": 123,
+    }
+
+    with pytest.raises(ValueError, match="oww_model_path must be a non-empty string"):
+        WakeWordFilter.validate_config(config)
+
+
+# Tests for oww_threshold validation
+
+
+def test_validate_config_accepts_valid_oww_threshold(mock_env):
+    """Test validate_config accepts valid oww_threshold"""
+    config = Mock()
+    config.attributes = Mock()
+
+    mock_env["struct_to_dict"].return_value = {
+        "source_microphone": "mic",
+        "wake_words": ["robot"],
+        "detection_engine": "openwakeword",
+        "oww_model_path": "/path/to/model.onnx",
+        "oww_threshold": 0.7,
+    }
+
+    deps, errors = WakeWordFilter.validate_config(config)
+    assert deps == ["mic"]
+    assert not errors
+
+
+def test_validate_config_rejects_oww_threshold_too_low(mock_env):
+    """Test validate_config raises error when oww_threshold below 0"""
+    config = Mock()
+    config.attributes = Mock()
+
+    mock_env["struct_to_dict"].return_value = {
+        "source_microphone": "mic",
+        "wake_words": ["robot"],
+        "detection_engine": "openwakeword",
+        "oww_model_path": "/path/to/model.onnx",
+        "oww_threshold": -0.1,
+    }
+
+    with pytest.raises(ValueError, match="oww_threshold must be 0.0-1.0"):
+        WakeWordFilter.validate_config(config)
+
+
+def test_validate_config_rejects_oww_threshold_too_high(mock_env):
+    """Test validate_config raises error when oww_threshold above 1"""
+    config = Mock()
+    config.attributes = Mock()
+
+    mock_env["struct_to_dict"].return_value = {
+        "source_microphone": "mic",
+        "wake_words": ["robot"],
+        "detection_engine": "openwakeword",
+        "oww_model_path": "/path/to/model.onnx",
+        "oww_threshold": 1.5,
+    }
+
+    with pytest.raises(ValueError, match="oww_threshold must be 0.0-1.0"):
+        WakeWordFilter.validate_config(config)
+
+
+def test_validate_config_rejects_non_number_oww_threshold(mock_env):
+    """Test validate_config raises error when oww_threshold is not a number"""
+    config = Mock()
+    config.attributes = Mock()
+
+    mock_env["struct_to_dict"].return_value = {
+        "source_microphone": "mic",
+        "wake_words": ["robot"],
+        "detection_engine": "openwakeword",
+        "oww_model_path": "/path/to/model.onnx",
+        "oww_threshold": "high",
+    }
+
+    with pytest.raises(ValueError, match="oww_threshold must be a number"):
+        WakeWordFilter.validate_config(config)
+
+
+def test_validate_config_oww_threshold_not_validated_for_vosk(mock_env):
+    """Test validate_config ignores oww_threshold when engine is vosk"""
+    config = Mock()
+    config.attributes = Mock()
+
+    mock_env["struct_to_dict"].return_value = {
+        "source_microphone": "mic",
+        "wake_words": ["robot"],
+        "detection_engine": "vosk",
+        "oww_threshold": 999,  # Invalid but should be ignored
+    }
+
+    deps, errors = WakeWordFilter.validate_config(config)
+    assert deps == ["mic"]
+    assert not errors
 
 
 @pytest.mark.asyncio
@@ -991,8 +1156,13 @@ async def test_get_audio_rejects_non_pcm16_codec():
 @pytest.mark.asyncio
 async def test_get_audio_rejects_invalid_sample_rate(mock_env):
     """Test get_audio raises error when microphone sample rate is not 16000 Hz"""
+    import types
+
     wake_word_filter = Mock()
     wake_word_filter.logger = Mock()
+    wake_word_filter._validate_mic_properties = types.MethodType(
+        WakeWordFilter._validate_mic_properties, wake_word_filter
+    )
 
     # Mock microphone with wrong sample rate
     mic = AsyncMock()
@@ -1041,8 +1211,13 @@ async def test_get_properties_always_reports_pcm16():
 @pytest.mark.asyncio
 async def test_get_audio_rejects_stereo_audio(mock_env):
     """Test get_audio raises error when microphone is stereo (2 channels)"""
+    import types
+
     wake_word_filter = Mock()
     wake_word_filter.logger = Mock()
+    wake_word_filter._validate_mic_properties = types.MethodType(
+        WakeWordFilter._validate_mic_properties, wake_word_filter
+    )
 
     # Mock microphone with stereo audio
     mic = AsyncMock()
@@ -1094,7 +1269,7 @@ async def test_process_speech_segment_skips_when_shutting_down():
 
     # Should yield nothing when shutting down
     chunks = []
-    async for chunk in WakeWordFilter._process_speech_segment(
+    async for chunk in WakeWordFilter._vosk_process_segment(
         wake_word_filter, chunk_buffer, byte_buffer
     ):
         chunks.append(chunk)
@@ -1124,7 +1299,7 @@ async def test_process_speech_segment_handles_executor_shutdown_error():
         mock_loop.return_value.run_in_executor = mock_run_in_executor
 
         chunks = []
-        async for chunk in WakeWordFilter._process_speech_segment(
+        async for chunk in WakeWordFilter._vosk_process_segment(
             wake_word_filter, chunk_buffer, byte_buffer
         ):
             chunks.append(chunk)
@@ -1160,7 +1335,7 @@ async def test_process_speech_segment_yields_chunks_on_wake_word():
             mock_audio_chunk_class.return_value = empty_chunk
 
             chunks = []
-            async for chunk in WakeWordFilter._process_speech_segment(
+            async for chunk in WakeWordFilter._vosk_process_segment(
                 wake_word_filter, chunk_buffer, byte_buffer
             ):
                 chunks.append(chunk)
@@ -1198,7 +1373,7 @@ async def test_process_speech_segment_yields_empty_chunk_at_end():
             mock_audio_chunk_class.return_value = empty_chunk
 
             chunks = []
-            async for chunk in WakeWordFilter._process_speech_segment(
+            async for chunk in WakeWordFilter._vosk_process_segment(
                 wake_word_filter, chunk_buffer, byte_buffer
             ):
                 chunks.append(chunk)
@@ -1228,7 +1403,7 @@ async def test_process_speech_segment_yields_nothing_when_no_wake_word():
         mock_loop.return_value.run_in_executor = mock_run_in_executor
 
         chunks = []
-        async for chunk in WakeWordFilter._process_speech_segment(
+        async for chunk in WakeWordFilter._vosk_process_segment(
             wake_word_filter, chunk_buffer, byte_buffer
         ):
             chunks.append(chunk)
@@ -1274,3 +1449,130 @@ async def test_do_command_unknown_raises_error():
 
     with pytest.raises(ValueError, match="Unknown command"):
         await WakeWordFilter.do_command(wake_word_filter, {"unknown": None})
+
+
+# OWW detection tests (via get_audio stream)
+
+
+def make_audio_chunk(num_bytes=960):
+    """Create a mock audio chunk with silence audio data."""
+    chunk = Mock()
+    chunk.audio = Mock()
+    chunk.audio.audio_data = b"\x00" * num_bytes
+    return chunk
+
+
+async def collect_stream(stream):
+    """Collect all chunks from an async stream."""
+    chunks = []
+    async for chunk in stream:
+        chunks.append(chunk)
+    return chunks
+
+
+async def async_iter(items):
+    """Convert a list to an async iterator."""
+    for item in items:
+        yield item
+
+
+def make_oww_filter(threshold=0.5, model_name="okay_gambit"):
+    """Create a mock WakeWordFilter configured for OWW."""
+    wf = Mock()
+    wf.detection_engine = "openwakeword"
+    wf.oww_threshold = threshold
+    wf.oww_model_name = model_name
+    wf.oww_model = Mock()
+    wf.oww_model.prediction_buffer = {}
+    wf.is_shutting_down = False
+    wf.detection_running = True
+    wf.vad = Mock()
+    wf.silence_duration_ms = 900
+    wf.min_speech_duration_ms = 300
+    wf.logger = Mock()
+    wf.microphone_client = AsyncMock()
+    # Bind real methods so async-generator calls work correctly
+    import types
+
+    wf._finalize_segment = types.MethodType(WakeWordFilter._finalize_segment, wf)
+    wf._validate_mic_properties = types.MethodType(
+        WakeWordFilter._validate_mic_properties, wf
+    )
+    return wf
+
+
+@pytest.mark.asyncio
+async def test_oww_detects_wake_word_above_threshold():
+    """Test OWW yields chunks when score is above threshold."""
+    wf = make_oww_filter(threshold=0.5)
+
+    wf.vad.is_speech.return_value = True
+    wf.oww_model.predict.return_value = {"okay_gambit": 0.9}
+
+    speech_chunks = [make_audio_chunk(960) for _ in range(15)]
+    silence_chunks = [make_audio_chunk(960) for _ in range(35)]
+
+    wf.vad.is_speech.side_effect = [True] * 15 + [False] * 35
+
+    wf.microphone_client.get_audio.return_value = async_iter(
+        speech_chunks + silence_chunks
+    )
+    wf.microphone_client.get_properties.return_value = Mock(
+        sample_rate_hz=16000, num_channels=1
+    )
+
+    stream = await WakeWordFilter.get_audio(wf, "pcm16", 0, 0)
+    chunks = await collect_stream(stream)
+
+    assert len(chunks) > 0
+    assert chunks[-1].audio.audio_data == b""
+
+
+@pytest.mark.asyncio
+async def test_oww_does_not_yield_when_below_threshold():
+    """Test OWW does not yield chunks when score is below threshold."""
+    wf = make_oww_filter(threshold=0.5)
+
+    wf.vad.is_speech.side_effect = [True] * 15 + [False] * 35
+    wf.oww_model.predict.return_value = {"okay_gambit": 0.1}
+    wf.oww_model.prediction_buffer = {"okay_gambit": [0.1]}
+
+    speech_chunks = [make_audio_chunk(960) for _ in range(15)]
+    silence_chunks = [make_audio_chunk(960) for _ in range(35)]
+
+    wf.microphone_client.get_audio.return_value = async_iter(
+        speech_chunks + silence_chunks
+    )
+    wf.microphone_client.get_properties.return_value = Mock(
+        sample_rate_hz=16000, num_channels=1
+    )
+
+    stream = await WakeWordFilter.get_audio(wf, "pcm16", 0, 0)
+    chunks = await collect_stream(stream)
+
+    assert len(chunks) == 0
+
+
+@pytest.mark.asyncio
+async def test_oww_resets_model_after_segment():
+    """Test OWW model is reset after each speech segment."""
+    wf = make_oww_filter(threshold=0.5)
+
+    wf.vad.is_speech.side_effect = [True] * 15 + [False] * 35
+    wf.oww_model.predict.return_value = {"okay_gambit": 0.1}
+    wf.oww_model.prediction_buffer = {"okay_gambit": [0.1]}
+
+    speech_chunks = [make_audio_chunk(960) for _ in range(15)]
+    silence_chunks = [make_audio_chunk(960) for _ in range(35)]
+
+    wf.microphone_client.get_audio.return_value = async_iter(
+        speech_chunks + silence_chunks
+    )
+    wf.microphone_client.get_properties.return_value = Mock(
+        sample_rate_hz=16000, num_channels=1
+    )
+
+    stream = await WakeWordFilter.get_audio(wf, "pcm16", 0, 0)
+    await collect_stream(stream)
+
+    wf.oww_model.reset.assert_called()
