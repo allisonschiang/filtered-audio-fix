@@ -11,9 +11,12 @@ import urllib.request
 from typing import Any
 
 import certifi
-
+import numpy as np
 
 from .download import download_file
+
+# OWW inference chunks: 16kHz * 0.080s = 1280 samples * 2 bytes = 2560 bytes
+OWW_CHUNK_SIZE = 2560
 
 
 def _ensure_preprocessing_models(
@@ -97,3 +100,26 @@ def setup_oww(instance: Any, oww_model_path: str, oww_threshold: float) -> None:
     instance.logger.info(
         f"openWakeWord model loaded (threshold={instance.oww_threshold})"
     )
+
+
+def oww_check_for_wake_word(instance: Any, oww_audio_buffer: bytearray) -> bool:
+    """Drain oww_audio_buffer in chunks and run OWW inference on each.
+
+    Inference runs synchronously on the event loop thread. OWW inference on CPU is ~5ms
+    per 80ms chunk on Pi, so this is fine. If heavier models are needed,
+    offload to a ThreadPoolExecutor.
+    """
+    while len(oww_audio_buffer) >= OWW_CHUNK_SIZE:
+        oww_chunk = bytes(oww_audio_buffer[:OWW_CHUNK_SIZE])
+        del oww_audio_buffer[:OWW_CHUNK_SIZE]
+        audio_int16 = np.frombuffer(oww_chunk, dtype=np.int16)
+        prediction = instance.oww_model.predict(audio_int16)
+        score = prediction.get(instance.oww_model_name, 0.0)
+        if score >= instance.oww_threshold:
+            instance.logger.info(
+                "Wake word detected (score=%.3f >= %.3f)",
+                score,
+                instance.oww_threshold,
+            )
+            return True
+    return False
