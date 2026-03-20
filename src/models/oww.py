@@ -26,11 +26,13 @@ def _ensure_preprocessing_models(
     for m in list(openwakeword.FEATURE_MODELS.values()) + list(
         openwakeword.VAD_MODELS.values()
     ):
-        url = m["download_url"].replace(".tflite", ".onnx")
-        fname = url.split("/")[-1]
-        if not os.path.exists(os.path.join(models_dir, fname)):
-            logger.info(f"Downloading OWW preprocessing model: {fname}")
-            openwakeword.utils.download_file(url, models_dir)
+        tflite_url = m["download_url"]
+        onnx_url = tflite_url.replace(".tflite", ".onnx")
+        for url in [tflite_url, onnx_url]:
+            fname = url.split("/")[-1]
+            if not os.path.exists(os.path.join(models_dir, fname)):
+                logger.info(f"Downloading OWW preprocessing model: {fname}")
+                openwakeword.utils.download_file(url, models_dir)
 
 
 def _resolve_oww_model_path(url: str, logger: logging.Logger) -> str:
@@ -87,9 +89,21 @@ def setup_oww(instance: Any, oww_model_path: str, oww_threshold: float) -> None:
     instance.oww_threshold = oww_threshold
 
     instance.logger.debug("Loading OWW model...")
+
+    _, extension = os.path.splitext(oww_model_path)
+
+    if extension not in (".onnx", ".tflite"):
+        raise ValueError(
+            f"oww_model_path file extension must be .onnx or .tflite, got {extension}"
+        )
+    if extension == ".tflite" and sys.platform != "linux":
+        raise ValueError(
+            "tflite models are only supported on Linux. "
+            "Please use an .onnx model instead."
+        )
     instance.oww_model = OWWModel(
         wakeword_models=[oww_model_path],
-        inference_framework="onnx",
+        inference_framework=extension.lstrip("."),
         enable_speex_noise_suppression=(
             sys.platform == "linux"
         ),  # not supported on mac
