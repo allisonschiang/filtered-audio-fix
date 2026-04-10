@@ -326,14 +326,30 @@ async def vosk_process_segment(
         )
 
         if wake_word_end_time is not None:
+            total_bytes = len(speech_buffer)
+            total_duration = total_bytes / (AUDIO_SAMPLE_RATE_HZ * 2)
+
             # Calculate the byte offset where the wake word ends.
             # 16kHz sample rate, 2 bytes per sample (16-bit PCM).
-            skip_bytes = int(wake_word_end_time * AUDIO_SAMPLE_RATE_HZ * 2)
-            total_bytes = len(speech_buffer)
+            # In grammar mode, Vosk may return timestamps longer than
+            # the actual audio. Use the wake word duration relative to
+            # total duration to estimate the skip proportion instead.
+            if wake_word_end_time > total_duration:
+                # Timestamps are unreliable — estimate based on wake word
+                # length. The wake word is typically short, so yield
+                # everything after the first ~2 seconds.
+                wake_word_words = len(instance.wake_words[0].split()) if instance.wake_words else 1
+                estimated_wake_duration = wake_word_words * 0.5  # ~0.5s per word
+                skip_bytes = int(estimated_wake_duration * AUDIO_SAMPLE_RATE_HZ * 2)
+            else:
+                skip_bytes = int(wake_word_end_time * AUDIO_SAMPLE_RATE_HZ * 2)
+
+            skip_bytes = min(skip_bytes, total_bytes)
 
             instance.logger.info(
                 f"Wake word ends at {wake_word_end_time:.2f}s "
-                f"(skipping {skip_bytes} of {total_bytes} bytes, "
+                f"(audio duration {total_duration:.2f}s, "
+                f"skipping {skip_bytes} of {total_bytes} bytes, "
                 f"yielding {total_bytes - skip_bytes} bytes of post-wake-word audio)"
             )
 
