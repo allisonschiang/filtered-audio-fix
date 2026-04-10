@@ -51,7 +51,7 @@ FRAME_SIZE_BYTES = 960
 
 class WakeWordFilter(AudioIn, EasyResource):
     MODEL: ClassVar[Model] = Model(
-        ModelFamily("viam", "filtered-audio"), "wake-word-filter"
+        ModelFamily("allisonorg", "filtered-audio-fix"), "wake-word-filter"
     )
 
     # Instance variables
