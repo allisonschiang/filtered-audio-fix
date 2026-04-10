@@ -1,13 +1,13 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
-  "module_id": "viam:filtered-audio",
-  "visibility": "public",
-  "url": "https://github.com/viam-modules/filtered-audio",
+  "module_id": "allisonorg:filtered-audio-fix",
+  "visibility": "private",
+  "url": "",
   "description": "audio filters from a source microphone",
   "models": [
     {
       "api": "rdk:component:audio_in",
-      "model": "viam:filtered-audio:wake-word-filter",
+      "model": "allisonorg:filtered-audio-fix:wake-word-filter",
       "markdown_link": "README.md#model-viamfiltered-audiowake-word-filter",
       "short_description": "filters audio stream based on wake word detection"
     }

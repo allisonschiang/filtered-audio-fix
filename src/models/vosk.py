@@ -216,17 +216,43 @@ def setup_vosk(
         instance.fuzzy_matcher = None
 
 
-def vosk_check_for_wake_word(instance: Any, audio_bytes: bytes) -> bool:
-    """Check if any wake word is present in the audio using Vosk."""
+def _find_wake_word_end_time(
+    full_text: str, matched_text: str, word_results: list
+) -> Optional[float]:
+    """Find the end time of a matched wake word phrase in the Vosk word results."""
+    if not word_results:
+        return None
+
+    matched_words = matched_text.lower().split()
+    text_words = full_text.lower().split()
+
+    # Find where the matched words appear in the full text
+    for i in range(len(text_words) - len(matched_words) + 1):
+        if text_words[i : i + len(matched_words)] == matched_words:
+            end_idx = i + len(matched_words) - 1
+            if end_idx < len(word_results):
+                return word_results[end_idx].get("end", 0.0)
+            break
+
+    # Fallback: use the last word's end time
+    return word_results[-1].get("end", 0.0)
+
+
+def vosk_check_for_wake_word(instance: Any, audio_bytes: bytes) -> Optional[float]:
+    """Check if any wake word is present in the audio using Vosk.
+
+    Returns the end time (in seconds) of the wake word if detected, or None.
+    """
     try:
         instance.recognizer.AcceptWaveform(audio_bytes)
         result = json.loads(instance.recognizer.FinalResult())
         text = result.get("text", "").lower()
+        word_results = result.get("result", [])
 
         instance.logger.debug("Vosk result: %s", result)
-        if "result" in result and result["result"]:
-            avg_conf = sum(w.get("conf", 1.0) for w in result["result"])
-            avg_conf /= len(result["result"])
+        if word_results:
+            avg_conf = sum(w.get("conf", 1.0) for w in word_results)
+            avg_conf /= len(word_results)
             instance.logger.debug("Vosk confidence: %.2f", avg_conf)
             if avg_conf < instance.grammar_confidence:
                 instance.logger.debug(
@@ -235,13 +261,13 @@ def vosk_check_for_wake_word(instance: Any, audio_bytes: bytes) -> bool:
                     avg_conf,
                     instance.grammar_confidence,
                 )
-                return False
+                return None
 
         if text:
             instance.logger.debug(f"Recognized: '{text}'")
         else:
             instance.logger.debug("Vosk returned empty text, no speech recognized")
-            return False
+            return None
 
         for wake_word in instance.wake_words:
             if instance.fuzzy_matcher and not instance.use_grammar:
@@ -252,7 +278,10 @@ def vosk_check_for_wake_word(instance: Any, audio_bytes: bytes) -> bool:
                         f"'{match_details['matched_text']}', "
                         f"distance={match_details['distance']})"
                     )
-                    return True
+                    end_time = _find_wake_word_end_time(
+                        text, match_details["matched_text"], word_results
+                    )
+                    return end_time if end_time is not None else 0.0
             else:
                 pattern = rf"\b{re.escape(wake_word)}\b"
                 match = re.search(pattern, text)
@@ -265,13 +294,16 @@ def vosk_check_for_wake_word(instance: Any, audio_bytes: bytes) -> bool:
                 )
                 if match:
                     instance.logger.info("Wake word '%s' detected", wake_word)
-                    return True
+                    end_time = _find_wake_word_end_time(
+                        text, text[match.start() : match.end()], word_results
+                    )
+                    return end_time if end_time is not None else 0.0
 
         instance.logger.debug("No wake word match found")
-        return False
+        return None
     except Exception as e:
         instance.logger.error(f"Vosk error: {e}", exc_info=True)
-        return False
+        return None
 
 
 async def vosk_process_segment(
@@ -286,19 +318,32 @@ async def vosk_process_segment(
         return
 
     try:
-        wake_word_detected = await asyncio.get_running_loop().run_in_executor(
+        wake_word_end_time = await asyncio.get_running_loop().run_in_executor(
             instance.executor,
             vosk_check_for_wake_word,
             instance,
             bytes(speech_buffer),
         )
 
-        if wake_word_detected:
+        if wake_word_end_time is not None:
+            # Calculate the byte offset where the wake word ends.
+            # 16kHz sample rate, 2 bytes per sample (16-bit PCM).
+            skip_bytes = int(wake_word_end_time * AUDIO_SAMPLE_RATE_HZ * 2)
+            total_bytes = len(speech_buffer)
+
             instance.logger.info(
-                f"Wake word detected! Yielding {len(speech_chunk_buffer)} chunks ({len(speech_buffer)} bytes)"
+                f"Wake word ends at {wake_word_end_time:.2f}s "
+                f"(skipping {skip_bytes} of {total_bytes} bytes, "
+                f"yielding {total_bytes - skip_bytes} bytes of post-wake-word audio)"
             )
+
+            cumulative = 0
             for chunk in speech_chunk_buffer:
-                yield chunk
+                chunk_size = len(chunk.audio.audio_data)
+                cumulative += chunk_size
+                if cumulative > skip_bytes:
+                    yield chunk
+
             empty_response = AudioChunk()
             empty_response.audio.audio_data = b""
             yield empty_response
