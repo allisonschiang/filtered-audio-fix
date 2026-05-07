@@ -11,6 +11,7 @@ from typing import (
 )
 from ._speech_segment import _SpeechState, _SpeechSegment, _SegmentThresholds
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 import webrtcvad
 from typing_extensions import Self
@@ -73,6 +74,9 @@ class WakeWordFilter(AudioIn, EasyResource):
     oww_model: Optional[Any]
     oww_model_name: Optional[str]
     oww_threshold: float
+    # bypass_until is a monotonic-clock deadline; while now < bypass_until,
+    # speech segments yield downstream without requiring a wake word.
+    bypass_until: float
 
     @classmethod
     def new(
@@ -163,6 +167,9 @@ class WakeWordFilter(AudioIn, EasyResource):
 
         # Detection pause state (for muting during TTS playback)
         instance.detection_running = True
+
+        # Bypass-window deadline (monotonic). 0 = no active window.
+        instance.bypass_until = 0.0
 
         return instance
 
@@ -474,6 +481,24 @@ class WakeWordFilter(AudioIn, EasyResource):
         Vosk: detection hasn't run yet — run inference on the full buffered
         segment now, then yield chunks if the wake word was found.
         """
+        # Bypass window: yield segment unconditionally if a follow-up window
+        # is active. Used to allow conversational replies without the wake word
+        # for a configurable period after the system speaks.
+        if time.monotonic() < self.bypass_until:
+            self.logger.info(
+                "Bypass window active — yielding %d chunks (%d bytes) without wake-word check",
+                len(speech_chunk_buffer),
+                len(speech_buffer),
+            )
+            for chunk in speech_chunk_buffer:
+                yield chunk
+            empty_response = AudioChunk()
+            empty_response.audio.audio_data = b""
+            yield empty_response
+            if self.detection_engine == "openwakeword" and self.oww_model is not None:
+                self.oww_model.reset()
+            return
+
         if self.detection_engine == "openwakeword":
             if oww_detected:
                 self.logger.info(
@@ -616,10 +641,17 @@ class WakeWordFilter(AudioIn, EasyResource):
         Supported commands:
         - pause_detection: Pause wake word detection
         - resume_detection: Resume wake word detection
+        - open_window: Open a follow-up window where speech segments yield
+          downstream without requiring the wake word. Accepts a number of
+          seconds (int/float) or a dict {"seconds": N}. Defaults to 10s.
+        - close_window: Cancel any active bypass window immediately.
 
         Examples:
-            {"pause_detection": None}  # pause detection
-            {"resume_detection": None}    # resume detection
+            {"pause_detection": None}
+            {"resume_detection": None}
+            {"open_window": 10}
+            {"open_window": {"seconds": 8}}
+            {"close_window": None}
         """
         if "pause_detection" in command:
             self.detection_running = False
@@ -630,6 +662,24 @@ class WakeWordFilter(AudioIn, EasyResource):
             self.detection_running = True
             self.logger.info("Detection resumed")
             return {"status": "resumed"}
+
+        elif "open_window" in command:
+            raw = command.get("open_window")
+            seconds: float = 10.0
+            if isinstance(raw, dict) and "seconds" in raw:
+                seconds = float(raw["seconds"])
+            elif isinstance(raw, (int, float)):
+                seconds = float(raw)
+            if seconds <= 0:
+                raise ValueError(f"open_window seconds must be positive, got {seconds}")
+            self.bypass_until = time.monotonic() + seconds
+            self.logger.info(f"Bypass window opened for {seconds}s")
+            return {"status": "opened", "seconds": seconds}
+
+        elif "close_window" in command:
+            self.bypass_until = 0.0
+            self.logger.info("Bypass window closed")
+            return {"status": "closed"}
 
         else:
             raise ValueError(f"Unknown command keys: {list(command.keys())}")
